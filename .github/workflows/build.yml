@@ -1,0 +1,197 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project Flutter"
+        required: true
+        type: string
+      tag:
+        description: "Tag build"
+        required: true
+        type: string
+      build_type:
+        description: "Mode build APK"
+        required: true
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+      only_analyze:
+        description: "Hanya jalankan analyze (true/false)"
+        required: false
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Download ZIP project
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$ZIP_URL" ]]; then
+            echo "::error::zip_url kosong."
+            exit 1
+          fi
+
+          echo "Mengunduh source project..."
+          if [[ -n "${GH_TOKEN:-}" ]]; then
+            curl --fail --location --silent --show-error --retry 2 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              "$ZIP_URL" -o project.zip
+          else
+            curl --fail --location --silent --show-error --retry 2 \
+              "$ZIP_URL" -o project.zip
+          fi
+
+          if ! unzip -tq project.zip >/dev/null; then
+            echo "::error::URL tidak menghasilkan file ZIP yang valid. Periksa zip_url dan akses token."
+            file project.zip || true
+            exit 1
+          fi
+
+      - name: Extract ZIP and locate project root
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
+
+          PROJECT_DIR="project_raw"
+          PUBSPEC="$(find project_raw -maxdepth 4 -type f -name pubspec.yaml -print -quit)"
+          GRADLEW="$(find project_raw -maxdepth 5 -type f -name gradlew -print -quit)"
+
+          if [[ -n "$PUBSPEC" ]]; then
+            PROJECT_DIR="$(dirname "$PUBSPEC")"
+          elif [[ -n "$GRADLEW" ]]; then
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+          else
+            echo "::error::Tidak ditemukan pubspec.yaml atau gradlew di dalam ZIP."
+            find project_raw -maxdepth 4 -type f | head -80
+            exit 1
+          fi
+
+          PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project root: $PROJECT_DIR"
+
+      - name: Get Flutter dependencies
+        if: ${{ hashFiles('project_raw/**/pubspec.yaml') != '' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f pubspec.yaml ]]; then
+            flutter pub get
+          else
+            echo "Project native Android; pub get dilewati."
+          fi
+
+      - name: Analyze project
+        id: analyze
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [[ -f "$PROJECT_DIR/pubspec.yaml" ]]; then
+            cd "$PROJECT_DIR"
+            set +e
+            flutter analyze 2>&1 | tee analyze_report.txt
+            ANALYZE_STATUS=${PIPESTATUS[0]}
+            set -e
+            echo "ANALYZE_STATUS=$ANALYZE_STATUS" >> "$GITHUB_ENV"
+            if [[ "$ANALYZE_STATUS" -ne 0 ]]; then
+              echo "::warning::flutter analyze menemukan masalah. Lihat log di atas."
+            fi
+          else
+            echo "Analyze Flutter dilewati: pubspec.yaml tidak ditemukan (project native Android)."
+            echo "ANALYZE_STATUS=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Stop after analyze-only
+        if: ${{ inputs.only_analyze == 'true' }}
+        run: echo "Analyze-only aktif; proses build dilewati."
+
+      - name: Flutter Doctor
+        if: ${{ inputs.only_analyze != 'true' }}
+        run: flutter doctor -v
+
+      - name: Build APK
+        if: ${{ inputs.only_analyze != 'true' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$BUILD_TYPE" in
+            debug|release) ;;
+            *)
+              echo "::error::build_type harus debug atau release."
+              exit 1
+              ;;
+          esac
+
+          if [[ -f pubspec.yaml ]]; then
+            flutter build apk "--$BUILD_TYPE"
+          elif [[ -f gradlew ]]; then
+            chmod +x gradlew
+            if [[ "$BUILD_TYPE" == "debug" ]]; then
+              ./gradlew assembleDebug
+            else
+              ./gradlew assembleRelease
+            fi
+          else
+            echo "::error::Project bukan project Flutter atau Android Gradle yang dikenali."
+            exit 1
+          fi
+
+      - name: Find APK
+        if: ${{ inputs.only_analyze != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_PATH="$(find "$PROJECT_DIR" -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK_PATH" ]]; then
+            echo "::error::Build selesai tetapi file APK tidak ditemukan."
+            exit 1
+          fi
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          ls -lh "$APK_PATH"
+
+      - name: Upload APK artifact
+        if: ${{ inputs.only_analyze != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-${{ inputs.build_type }}-${{ inputs.tag }}
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 7
+          
